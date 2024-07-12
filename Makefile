@@ -846,6 +846,7 @@ OBJ_GGML += \
 
 OBJ_LLAMA = \
 	src/llama.o \
+	src/llama-sampling.o \
 	src/unicode.o \
 	src/unicode-data.o
 
@@ -1025,6 +1026,7 @@ src/unicode-data.o: \
 
 src/llama.o: \
 	src/llama.cpp \
+	src/llama-impl.h \
 	src/unicode.h \
 	include/llama.h \
 	ggml/include/ggml-cuda.h \
@@ -1032,6 +1034,13 @@ src/llama.o: \
 	ggml/include/ggml.h \
 	ggml/include/ggml-alloc.h \
 	ggml/include/ggml-backend.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+src/llama-sampling.o: \
+	src/llama-sampling.cpp \
+	src/llama-sampling.h \
+	src/llama-impl.h \
+	include/llama.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(LIB_LLAMA): \

@@ -228,7 +228,7 @@ std::vector<llama_sampler_type> llama_sampling_types_from_chars(const std::strin
 
 // no reasons to expose this function in header
 static void sampler_queue(
-                   struct llama_context * ctx_main,
+                   struct llama_sampling * ctx_main,
             const llama_sampling_params & params,
                  llama_token_data_array & cur_p,
                                  size_t   min_keep) {
@@ -265,8 +265,8 @@ static void sampler_queue(
 
 static llama_token llama_sampling_sample_impl(
                   struct llama_sampling_context * ctx_sampling,
-                  struct llama_context * ctx_main,
-                  struct llama_context * ctx_cfg,
+                  struct llama_sampling * ctx_main,
+                  struct llama_sampling * ctx_cfg,
                   const int idx,
                   bool is_resampling) {
     const llama_sampling_params & params = ctx_sampling->params;
@@ -353,14 +353,14 @@ static llama_token llama_sampling_sample_impl(
 
 static llama_token_data_array llama_sampling_prepare_impl(
                   struct llama_sampling_context * ctx_sampling,
-                  struct llama_context * ctx_main,
-                  struct llama_context * ctx_cfg,
+                  struct llama_sampling * ctx_main,
+                  struct llama_sampling * ctx_cfg,
                   const int idx,
                   bool apply_grammar,
                   std::vector<float> * original_logits) {
     const llama_sampling_params & params = ctx_sampling->params;
 
-    const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
+    const int n_vocab = llama_n_vocab(llama_sampling_get_model(ctx_main));
 
     const int32_t penalty_last_n  = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
     const float   penalty_repeat  = params.penalty_repeat;
@@ -403,7 +403,7 @@ static llama_token_data_array llama_sampling_prepare_impl(
     const auto& penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : prev;
     const int penalty_tokens_used_size = std::min((int)penalty_tokens.size(), penalty_last_n);
     if (penalty_tokens_used_size) {
-        const float nl_logit = logits[llama_token_nl(llama_get_model(ctx_main))];
+        const float nl_logit = logits[llama_token_nl(llama_sampling_get_model(ctx_main))];
 
         llama_sample_repetition_penalties(ctx_main, &cur_p,
                 penalty_tokens.data() + penalty_tokens.size() - penalty_tokens_used_size,
@@ -411,7 +411,7 @@ static llama_token_data_array llama_sampling_prepare_impl(
 
         if (!penalize_nl) {
             for (size_t idx = 0; idx < cur_p.size; idx++) {
-                if (cur_p.data[idx].id == llama_token_nl(llama_get_model(ctx_main))) {
+                if (cur_p.data[idx].id == llama_token_nl(llama_sampling_get_model(ctx_main))) {
                     cur_p.data[idx].logit = nl_logit;
                     break;
                 }
@@ -429,8 +429,8 @@ static llama_token_data_array llama_sampling_prepare_impl(
 
 llama_token llama_sampling_sample(
                   struct llama_sampling_context * ctx_sampling,
-                  struct llama_context * ctx_main,
-                  struct llama_context * ctx_cfg,
+                  struct llama_sampling * ctx_main,
+                  struct llama_sampling * ctx_cfg,
                   const int idx) {
     // Call the implementation function with is_resampling set to false by default
     return llama_sampling_sample_impl(ctx_sampling, ctx_main, ctx_cfg, idx, /* is_resampling= */ false);
@@ -438,8 +438,8 @@ llama_token llama_sampling_sample(
 
 llama_token_data_array llama_sampling_prepare(
                   struct llama_sampling_context * ctx_sampling,
-                  struct llama_context * ctx_main,
-                  struct llama_context * ctx_cfg,
+                  struct llama_sampling * ctx_main,
+                  struct llama_sampling * ctx_cfg,
                   const int idx,
                   bool apply_grammar,
                   std::vector<float> * original_logits) {
@@ -448,7 +448,7 @@ llama_token_data_array llama_sampling_prepare(
 
 void llama_sampling_accept(
         struct llama_sampling_context * ctx_sampling,
-        struct llama_context * ctx_main,
+        struct llama_sampling * ctx_main,
         llama_token id,
         bool apply_grammar) {
     ctx_sampling->prev.erase(ctx_sampling->prev.begin());

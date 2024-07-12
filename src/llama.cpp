@@ -1,5 +1,4 @@
-#define LLAMA_API_INTERNAL
-#include "llama.h"
+#include "llama-impl.h"
 
 #include "unicode.h"
 
@@ -31,19 +30,6 @@
 
 // TODO: replace with ggml API call
 #define QK_K 256
-
-#ifdef __has_include
-    #if __has_include(<unistd.h>)
-        #include <unistd.h>
-        #if defined(_POSIX_MAPPED_FILES)
-            #include <sys/mman.h>
-            #include <fcntl.h>
-        #endif
-        #if defined(_POSIX_MEMLOCK_RANGE)
-            #include <sys/resource.h>
-        #endif
-    #endif
-#endif
 
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
@@ -88,7 +74,6 @@
 #include <mutex>
 #include <numeric>
 #include <queue>
-#include <random>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -99,33 +84,6 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
-
-#ifdef __GNUC__
-#ifdef __MINGW32__
-#define LLAMA_ATTRIBUTE_FORMAT(...) __attribute__((format(gnu_printf, __VA_ARGS__)))
-#else
-#define LLAMA_ATTRIBUTE_FORMAT(...) __attribute__((format(printf, __VA_ARGS__)))
-#endif
-#else
-#define LLAMA_ATTRIBUTE_FORMAT(...)
-#endif
-
-// bump if necessary
-#define LLAMA_MAX_NODES   8192
-#define LLAMA_MAX_LAYERS  256
-#define LLAMA_MAX_EXPERTS 160  // DeepSeekV2
-
-//
-// logging
-//
-
-LLAMA_ATTRIBUTE_FORMAT(2, 3)
-static void llama_log_internal        (ggml_log_level level, const char * format, ...);
-static void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
-
-#define LLAMA_LOG_INFO(...)  llama_log_internal(GGML_LOG_LEVEL_INFO , __VA_ARGS__)
-#define LLAMA_LOG_WARN(...)  llama_log_internal(GGML_LOG_LEVEL_WARN , __VA_ARGS__)
-#define LLAMA_LOG_ERROR(...) llama_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 
 //
 // helpers
@@ -151,6 +109,13 @@ static void replace_all(std::string & s, const std::string & search, const std::
     s = std::move(result);
 }
 
+static void zeros(std::ofstream & file, size_t n) {
+    char zero = 0;
+    for (size_t i = 0; i < n; ++i) {
+        file.write(&zero, 1);
+    }
+}
+
 static bool is_float_close(float a, float b, float abs_tol) {
     // Check for non-negative tolerance
     if (abs_tol < 0.0) {
@@ -171,13 +136,6 @@ static bool is_float_close(float a, float b, float abs_tol) {
     return std::fabs(b - a) <= abs_tol;
 }
 
-static void zeros(std::ofstream & file, size_t n) {
-    char zero = 0;
-    for (size_t i = 0; i < n; ++i) {
-        file.write(&zero, 1);
-    }
-}
-
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 static std::string format(const char * fmt, ...) {
     va_list ap;
@@ -193,6 +151,578 @@ static std::string format(const char * fmt, ...) {
     va_end(ap);
     return std::string(buf.data(), size);
 }
+
+#if defined(_WIN32)
+static std::string llama_format_win_err(DWORD err) {
+    LPSTR buf;
+    size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                 NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&buf, 0, NULL);
+    if (!size) {
+        return "FormatMessageA failed";
+    }
+    std::string ret(buf, size);
+    LocalFree(buf);
+    return ret;
+}
+#endif
+
+//
+// llama_file
+//
+
+struct llama_file {
+
+#if defined(_WIN32)
+    // use FILE * so we don't have to re-open the file to mmap
+    FILE * fp;
+    HANDLE fp_win32;
+    size_t size;
+
+private:
+    std::string GetErrorMessageWin32(DWORD error_code) const {
+        std::string ret;
+        LPSTR lpMsgBuf = NULL;
+        DWORD bufLen = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                    NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&lpMsgBuf, 0, NULL);
+        if (!bufLen) {
+            ret = format("Win32 error code: %s", error_code);
+        } else {
+            ret = lpMsgBuf;
+            LocalFree(lpMsgBuf);
+        }
+
+        return ret;
+    }
+
+public:
+
+    llama_file(const char * fname, const char * mode) {
+        fp = ggml_fopen(fname, mode);
+        if (fp == NULL) {
+            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+        }
+        fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
+        seek(0, SEEK_END);
+        size = tell();
+        seek(0, SEEK_SET);
+    }
+
+    size_t tell() const {
+        // SetFilePointerEx returns the current position when seeking relative 0 bytes
+        LARGE_INTEGER li;
+        li.QuadPart = 0;
+        BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
+        if (!ret) {
+            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+        }
+
+        return li.QuadPart;
+    }
+
+    void seek(size_t offset, int whence) const {
+        // no need to convert SEEK_* to FILE_*. The enums are the same.
+        // Still, keep static asserts to avoid failures in the future.
+        static_assert(SEEK_SET == FILE_BEGIN, "SEEK_SET != FILE_BEGIN");
+        static_assert(SEEK_CUR == FILE_CURRENT, "SEEK_CUR != FILE_CURRENT");
+        static_assert(SEEK_END == FILE_END, "SEEK_END != FILE_END");
+
+        LARGE_INTEGER li;
+        li.QuadPart = offset;
+        BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
+        if (!ret) {
+            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+        }
+    }
+
+    void read_raw(void * ptr, size_t len) const {
+        // On Win32 ReadFile is significant faster than fread which is again significant faster than std::fstream. Thus
+        // use the Win32 API to do file io instead of the C/C++ library functions.
+
+        // There are conditions under which ReadFile cannot read chunks >64MB.
+        // Thus split the operation into smaller chunks if len exceeds this limit.
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+            DWORD chunk_read = 0;
+            BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
+            if (!result) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_read < chunk_size || chunk_read == 0) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+
+            bytes_read += chunk_read;
+        } ;
+    }
+
+    uint32_t read_u32() const {
+        uint32_t val;
+        read_raw(&val, sizeof(val));
+        return val;
+    }
+
+    void write_raw(const void * ptr, size_t len) const {
+        // There are conditions under which WriteFile cannot write chunks >64MB.
+        // Thus split the operation into smaller chunks if len exceeds this limit.
+        size_t bytes_written = 0;
+        while (bytes_written < len) {
+            size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
+            DWORD chunk_written = 0;
+            BOOL result = WriteFile(fp_win32, reinterpret_cast<char const*>(ptr) + bytes_written, chunk_size, &chunk_written, NULL);
+            if (!result) {
+                throw std::runtime_error(format("write error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_written < chunk_size || chunk_written == 0) {
+                throw std::runtime_error("unexpectedly failed to write bytes");
+            }
+
+            bytes_written += chunk_written;
+        }
+    }
+
+    void write_u32(std::uint32_t val) const {
+        write_raw(&val, sizeof(val));
+    }
+
+    ~llama_file() {
+        if (fp) {
+            std::fclose(fp);
+        }
+    }
+#else
+    // use FILE * so we don't have to re-open the file to mmap
+    FILE * fp;
+    size_t size;
+
+    llama_file(const char * fname, const char * mode) {
+        fp = ggml_fopen(fname, mode);
+        if (fp == NULL) {
+            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+        }
+        seek(0, SEEK_END);
+        size = tell();
+        seek(0, SEEK_SET);
+    }
+
+    size_t tell() const {
+#ifdef _WIN32
+        __int64 ret = _ftelli64(fp);
+#else
+        long ret = std::ftell(fp);
+#endif
+        if (ret == -1) {
+            throw std::runtime_error(format("ftell error: %s", strerror(errno)));
+        }
+
+        return (size_t) ret;
+    }
+
+    void seek(size_t offset, int whence) const {
+#ifdef _WIN32
+        int ret = _fseeki64(fp, (__int64) offset, whence);
+#else
+        int ret = std::fseek(fp, (long) offset, whence);
+#endif
+        if (ret != 0) {
+            throw std::runtime_error(format("seek error: %s", strerror(errno)));
+        }
+    }
+
+    void read_raw(void * ptr, size_t len) const {
+        if (len == 0) {
+            return;
+        }
+        errno = 0;
+        std::size_t ret = std::fread(ptr, len, 1, fp);
+        if (ferror(fp)) {
+            throw std::runtime_error(format("read error: %s", strerror(errno)));
+        }
+        if (ret != 1) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+    }
+
+    uint32_t read_u32() const {
+        uint32_t ret;
+        read_raw(&ret, sizeof(ret));
+        return ret;
+    }
+
+    void write_raw(const void * ptr, size_t len) const {
+        if (len == 0) {
+            return;
+        }
+        errno = 0;
+        size_t ret = std::fwrite(ptr, len, 1, fp);
+        if (ret != 1) {
+            throw std::runtime_error(format("write error: %s", strerror(errno)));
+        }
+    }
+
+    void write_u32(std::uint32_t val) const {
+        write_raw(&val, sizeof(val));
+    }
+
+    ~llama_file() {
+        if (fp) {
+            std::fclose(fp);
+        }
+    }
+#endif
+};
+using llama_files = std::vector<std::unique_ptr<llama_file>>;
+
+struct llama_mmap {
+    void * addr;
+    size_t size;
+
+    llama_mmap(const llama_mmap &) = delete;
+
+#ifdef _POSIX_MAPPED_FILES
+    static constexpr bool SUPPORTED = true;
+
+    // list of mapped fragments (first_offset, last_offset)
+    std::vector<std::pair<size_t, size_t>> mapped_fragments;
+
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1 /* -1 = max value */, bool numa = false) {
+        size = file->size;
+        int fd = fileno(file->fp);
+        int flags = MAP_SHARED;
+        // prefetch/readahead impairs performance on NUMA systems
+        if (numa)  { prefetch = 0; }
+#ifdef __linux__
+        // advise the kernel to read the file sequentially (increases readahead)
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                    strerror(errno));
+        }
+        if (prefetch) { flags |= MAP_POPULATE; }
+#endif
+        addr = mmap(NULL, file->size, PROT_READ, flags, fd, 0);
+        if (addr == MAP_FAILED) { // NOLINT
+            throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+        }
+
+        if (prefetch > 0) {
+            // advise the kernel to preload the mapped memory
+            if (posix_madvise(addr, std::min(file->size, prefetch), POSIX_MADV_WILLNEED)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
+                        strerror(errno));
+            }
+        }
+        if (numa) {
+            // advise the kernel not to use readahead
+            // (because the next page might not belong on the same node)
+            if (posix_madvise(addr, file->size, POSIX_MADV_RANDOM)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+                        strerror(errno));
+            }
+        }
+
+        // initialize list of mapped_fragments
+        mapped_fragments.emplace_back(0, file->size);
+    }
+
+    static void align_range(size_t * first, size_t * last, size_t page_size) {
+        // align first to the next page
+        size_t offset_in_page = *first & (page_size - 1);
+        size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
+        *first += offset_to_page;
+
+        // align last to the previous page
+        *last = *last & ~(page_size - 1);
+
+        if (*last <= *first) {
+            *last = *first;
+        }
+    }
+
+    // partially unmap the file in the range [first, last)
+    void unmap_fragment(size_t first, size_t last) {
+        // note: this function must not be called multiple times with overlapping ranges
+        // otherwise, there is a risk of invalidating addresses that have been repurposed for other mappings
+        int page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        size_t len = last - first;
+
+        if (len == 0) {
+            return;
+        }
+
+        GGML_ASSERT(first % page_size == 0);
+        GGML_ASSERT(last % page_size == 0);
+        GGML_ASSERT(last > first);
+
+        void * next_page_start = (uint8_t *) addr + first;
+
+        // unmap the range
+        if (munmap(next_page_start, len)) {
+            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+        }
+
+        // update the list of mapped fragments to avoid unmapping the same range again in the destructor
+        std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
+        for (const auto & frag : mapped_fragments) {
+            if (frag.first < first && frag.second > last) {
+                // the range is in the middle of the fragment, split it
+                new_mapped_fragments.emplace_back(frag.first, first);
+                new_mapped_fragments.emplace_back(last, frag.second);
+            } else if (frag.first < first && frag.second > first) {
+                // the range starts in the middle of the fragment
+                new_mapped_fragments.emplace_back(frag.first, first);
+            } else if (frag.first < last && frag.second > last) {
+                // the range ends in the middle of the fragment
+                new_mapped_fragments.emplace_back(last, frag.second);
+            } else if (frag.first >= first && frag.second <= last) {
+                // the range covers the entire fragment
+            } else {
+                // the range is outside the fragment
+                new_mapped_fragments.push_back(frag);
+            }
+        }
+        mapped_fragments = std::move(new_mapped_fragments);
+    }
+
+    ~llama_mmap() {
+        for (const auto & frag : mapped_fragments) {
+            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
+                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+            }
+        }
+    }
+#elif defined(_WIN32)
+    static constexpr bool SUPPORTED = true;
+
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false) {
+        GGML_UNUSED(numa);
+
+        size = file->size;
+
+        HANDLE hFile = (HANDLE) _get_osfhandle(_fileno(file->fp));
+
+        HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+
+        if (hMapping == NULL) {
+            DWORD error = GetLastError();
+            throw std::runtime_error(format("CreateFileMappingA failed: %s", llama_format_win_err(error).c_str()));
+        }
+
+        addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        DWORD error = GetLastError();
+        CloseHandle(hMapping);
+
+        if (addr == NULL) {
+            throw std::runtime_error(format("MapViewOfFile failed: %s", llama_format_win_err(error).c_str()));
+        }
+
+        if (prefetch > 0) {
+#if _WIN32_WINNT >= 0x602
+            // PrefetchVirtualMemory is only present on Windows 8 and above, so we dynamically load it
+            BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+
+            // may fail on pre-Windows 8 systems
+            pPrefetchVirtualMemory = reinterpret_cast<decltype(pPrefetchVirtualMemory)> (GetProcAddress(hKernel32, "PrefetchVirtualMemory"));
+
+            if (pPrefetchVirtualMemory) {
+                // advise the kernel to preload the mapped memory
+                WIN32_MEMORY_RANGE_ENTRY range;
+                range.VirtualAddress = addr;
+                range.NumberOfBytes = (SIZE_T) std::min(size, prefetch);
+                if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                    LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
+                            llama_format_win_err(GetLastError()).c_str());
+                }
+            }
+#else
+            throw std::runtime_error("PrefetchVirtualMemory unavailable");
+#endif
+        }
+    }
+
+    void unmap_fragment(size_t first, size_t last) {
+        // not supported
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
+    ~llama_mmap() {
+        if (!UnmapViewOfFile(addr)) {
+            LLAMA_LOG_WARN("warning: UnmapViewOfFile failed: %s\n",
+                    llama_format_win_err(GetLastError()).c_str());
+        }
+    }
+#else
+    static constexpr bool SUPPORTED = false;
+
+    llama_mmap(struct llama_file * file, size_t prefetch = -1, bool numa = false) {
+        GGML_UNUSED(file);
+        GGML_UNUSED(prefetch);
+        GGML_UNUSED(numa);
+
+        throw std::runtime_error("mmap not supported");
+    }
+
+    void unmap_fragment(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
+#endif
+};
+using llama_mmaps = std::vector<std::unique_ptr<llama_mmap>>;
+
+// Represents some region of memory being locked using mlock or VirtualLock;
+// will automatically unlock on destruction.
+struct llama_mlock {
+    void * addr = NULL;
+    size_t size = 0;
+
+    bool failed_already = false;
+
+    llama_mlock() {}
+    llama_mlock(const llama_mlock &) = delete;
+
+    ~llama_mlock() {
+        if (size) {
+            raw_unlock(addr, size);
+        }
+    }
+
+    void init(void * ptr) {
+        GGML_ASSERT(addr == NULL && size == 0); // NOLINT
+        addr = ptr;
+    }
+
+    void grow_to(size_t target_size) {
+        GGML_ASSERT(addr);
+        if (failed_already) {
+            return;
+        }
+        size_t granularity = lock_granularity();
+        target_size = (target_size + granularity - 1) & ~(granularity - 1);
+        if (target_size > size) {
+            if (raw_lock((uint8_t *) addr + size, target_size - size)) {
+                size = target_size;
+            } else {
+                failed_already = true;
+            }
+        }
+    }
+
+#ifdef _POSIX_MEMLOCK_RANGE
+    static constexpr bool SUPPORTED = true;
+
+    static size_t lock_granularity() {
+        return (size_t) sysconf(_SC_PAGESIZE);
+    }
+
+    #ifdef __APPLE__
+        #define MLOCK_SUGGESTION \
+            "Try increasing the sysctl values 'vm.user_wire_limit' and 'vm.global_user_wire_limit' and/or " \
+            "decreasing 'vm.global_no_user_wire_amount'.  Also try increasing RLIMIT_MEMLOCK (ulimit -l).\n"
+    #else
+        #define MLOCK_SUGGESTION \
+            "Try increasing RLIMIT_MEMLOCK ('ulimit -l' as root).\n"
+    #endif
+
+    bool raw_lock(const void * addr, size_t size) const {
+        if (!mlock(addr, size)) {
+            return true;
+        }
+
+        char* errmsg = std::strerror(errno);
+        bool suggest = (errno == ENOMEM);
+
+        // Check if the resource limit is fine after all
+        struct rlimit lock_limit;
+        if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
+            suggest = false;
+        }
+        if (suggest && (lock_limit.rlim_max > lock_limit.rlim_cur + size)) {
+            suggest = false;
+        }
+
+        LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
+                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+        return false;
+    }
+
+    #undef MLOCK_SUGGESTION
+
+    static void raw_unlock(void * addr, size_t size) {
+        if (munlock(addr, size)) {
+            LLAMA_LOG_WARN("warning: failed to munlock buffer: %s\n", std::strerror(errno));
+        }
+    }
+#elif defined(_WIN32)
+    static constexpr bool SUPPORTED = true;
+
+    static size_t lock_granularity() {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return (size_t) si.dwPageSize;
+    }
+
+    bool raw_lock(void * ptr, size_t len) const {
+        for (int tries = 1; ; tries++) {
+            if (VirtualLock(ptr, len)) {
+                return true;
+            }
+            if (tries == 2) {
+                LLAMA_LOG_WARN("warning: failed to VirtualLock %zu-byte buffer (after previously locking %zu bytes): %s\n",
+                    len, size, llama_format_win_err(GetLastError()).c_str());
+                return false;
+            }
+
+            // It failed but this was only the first try; increase the working
+            // set size and try again.
+            SIZE_T min_ws_size, max_ws_size;
+            if (!GetProcessWorkingSetSize(GetCurrentProcess(), &min_ws_size, &max_ws_size)) {
+                LLAMA_LOG_WARN("warning: GetProcessWorkingSetSize failed: %s\n",
+                        llama_format_win_err(GetLastError()).c_str());
+                return false;
+            }
+            // Per MSDN: "The maximum number of pages that a process can lock
+            // is equal to the number of pages in its minimum working set minus
+            // a small overhead."
+            // Hopefully a megabyte is enough overhead:
+            size_t increment = len + 1048576;
+            // The minimum must be <= the maximum, so we need to increase both:
+            min_ws_size += increment;
+            max_ws_size += increment;
+            if (!SetProcessWorkingSetSize(GetCurrentProcess(), min_ws_size, max_ws_size)) {
+                LLAMA_LOG_WARN("warning: SetProcessWorkingSetSize failed: %s\n",
+                        llama_format_win_err(GetLastError()).c_str());
+                return false;
+            }
+        }
+    }
+
+    static void raw_unlock(void * ptr, size_t len) {
+        if (!VirtualUnlock(ptr, len)) {
+            LLAMA_LOG_WARN("warning: failed to VirtualUnlock buffer: %s\n",
+                    llama_format_win_err(GetLastError()).c_str());
+        }
+    }
+#else
+    static constexpr bool SUPPORTED = false;
+
+    static size_t lock_granularity() {
+        return (size_t) 65536;
+    }
+
+    bool raw_lock(const void * addr, size_t len) const {
+        LLAMA_LOG_WARN("warning: mlock not supported on this system\n");
+        return false;
+    }
+
+    static void raw_unlock(const void * addr, size_t len) {}
+#endif
+};
+using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
 //
 // gguf constants (sync with gguf.py)
@@ -240,6 +770,68 @@ enum llm_arch {
     LLM_ARCH_T5,
     LLM_ARCH_JAIS,
     LLM_ARCH_UNKNOWN,
+};
+
+// model sizes
+enum e_model {
+    MODEL_UNKNOWN,
+    MODEL_14M,
+    MODEL_17M,
+    MODEL_22M,
+    MODEL_33M,
+    MODEL_60M,
+    MODEL_70M,
+    MODEL_80M,
+    MODEL_109M,
+    MODEL_137M,
+    MODEL_160M,
+    MODEL_220M,
+    MODEL_250M,
+    MODEL_270M,
+    MODEL_335M,
+    MODEL_410M,
+    MODEL_450M,
+    MODEL_770M,
+    MODEL_780M,
+    MODEL_0_5B,
+    MODEL_1B,
+    MODEL_1_3B,
+    MODEL_1_4B,
+    MODEL_2B,
+    MODEL_2_8B,
+    MODEL_3B,
+    MODEL_4B,
+    MODEL_6B,
+    MODEL_6_9B,
+    MODEL_7B,
+    MODEL_8B,
+    MODEL_9B,
+    MODEL_11B,
+    MODEL_12B,
+    MODEL_13B,
+    MODEL_14B,
+    MODEL_15B,
+    MODEL_16B,
+    MODEL_20B,
+    MODEL_30B,
+    MODEL_34B,
+    MODEL_35B,
+    MODEL_40B,
+    MODEL_65B,
+    MODEL_70B,
+    MODEL_236B,
+    MODEL_314B,
+    MODEL_SMALL,
+    MODEL_MEDIUM,
+    MODEL_LARGE,
+    MODEL_XL,
+    MODEL_A2_7B,
+    MODEL_8x7B,
+    MODEL_8x22B,
+    MODEL_16x12B,
+    MODEL_10B_128x3_66B,
+    MODEL_57B_A14B,
+    MODEL_27B,
 };
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -1442,579 +2034,11 @@ static std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
 // llama helpers
 //
 
-#if defined(_WIN32)
-static std::string llama_format_win_err(DWORD err) {
-    LPSTR buf;
-    size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                                 NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&buf, 0, NULL);
-    if (!size) {
-        return "FormatMessageA failed";
-    }
-    std::string ret(buf, size);
-    LocalFree(buf);
-    return ret;
-}
-#endif
-
 template <typename T>
 struct no_init {
     T value;
     no_init() { /* do nothing */ }
 };
-
-struct llama_file {
-
-#if defined(_WIN32)
-    // use FILE * so we don't have to re-open the file to mmap
-    FILE * fp;
-    HANDLE fp_win32;
-    size_t size;
-
-private:
-    std::string GetErrorMessageWin32(DWORD error_code) const {
-        std::string ret;
-        LPSTR lpMsgBuf = NULL;
-        DWORD bufLen = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                                    NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&lpMsgBuf, 0, NULL);
-        if (!bufLen) {
-            ret = format("Win32 error code: %s", error_code);
-        } else {
-            ret = lpMsgBuf;
-            LocalFree(lpMsgBuf);
-        }
-
-        return ret;
-    }
-
-public:
-
-    llama_file(const char * fname, const char * mode) {
-        fp = ggml_fopen(fname, mode);
-        if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
-        }
-        fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
-        seek(0, SEEK_END);
-        size = tell();
-        seek(0, SEEK_SET);
-    }
-
-    size_t tell() const {
-        // SetFilePointerEx returns the current position when seeking relative 0 bytes
-        LARGE_INTEGER li;
-        li.QuadPart = 0;
-        BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
-        if (!ret) {
-            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-        }
-
-        return li.QuadPart;
-    }
-
-    void seek(size_t offset, int whence) const {
-        // no need to convert SEEK_* to FILE_*. The enums are the same.
-        // Still, keep static asserts to avoid failures in the future.
-        static_assert(SEEK_SET == FILE_BEGIN, "SEEK_SET != FILE_BEGIN");
-        static_assert(SEEK_CUR == FILE_CURRENT, "SEEK_CUR != FILE_CURRENT");
-        static_assert(SEEK_END == FILE_END, "SEEK_END != FILE_END");
-
-        LARGE_INTEGER li;
-        li.QuadPart = offset;
-        BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
-        if (!ret) {
-            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-        }
-    }
-
-    void read_raw(void * ptr, size_t len) const {
-        // On Win32 ReadFile is significant faster than fread which is again significant faster than std::fstream. Thus
-        // use the Win32 API to do file io instead of the C/C++ library functions.
-
-        // There are conditions under which ReadFile cannot read chunks >64MB.
-        // Thus split the operation into smaller chunks if len exceeds this limit.
-        size_t bytes_read = 0;
-        while (bytes_read < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
-            DWORD chunk_read = 0;
-            BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
-            if (!result) {
-                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-            }
-            if (chunk_read < chunk_size || chunk_read == 0) {
-                throw std::runtime_error("unexpectedly reached end of file");
-            }
-
-            bytes_read += chunk_read;
-        } ;
-    }
-
-    uint32_t read_u32() const {
-        uint32_t val;
-        read_raw(&val, sizeof(val));
-        return val;
-    }
-
-    void write_raw(const void * ptr, size_t len) const {
-        // There are conditions under which WriteFile cannot write chunks >64MB.
-        // Thus split the operation into smaller chunks if len exceeds this limit.
-        size_t bytes_written = 0;
-        while (bytes_written < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
-            DWORD chunk_written = 0;
-            BOOL result = WriteFile(fp_win32, reinterpret_cast<char const*>(ptr) + bytes_written, chunk_size, &chunk_written, NULL);
-            if (!result) {
-                throw std::runtime_error(format("write error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-            }
-            if (chunk_written < chunk_size || chunk_written == 0) {
-                throw std::runtime_error("unexpectedly failed to write bytes");
-            }
-
-            bytes_written += chunk_written;
-        }
-    }
-
-    void write_u32(std::uint32_t val) const {
-        write_raw(&val, sizeof(val));
-    }
-
-    ~llama_file() {
-        if (fp) {
-            std::fclose(fp);
-        }
-    }
-#else
-    // use FILE * so we don't have to re-open the file to mmap
-    FILE * fp;
-    size_t size;
-
-    llama_file(const char * fname, const char * mode) {
-        fp = ggml_fopen(fname, mode);
-        if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
-        }
-        seek(0, SEEK_END);
-        size = tell();
-        seek(0, SEEK_SET);
-    }
-
-    size_t tell() const {
-#ifdef _WIN32
-        __int64 ret = _ftelli64(fp);
-#else
-        long ret = std::ftell(fp);
-#endif
-        if (ret == -1) {
-            throw std::runtime_error(format("ftell error: %s", strerror(errno)));
-        }
-
-        return (size_t) ret;
-    }
-
-    void seek(size_t offset, int whence) const {
-#ifdef _WIN32
-        int ret = _fseeki64(fp, (__int64) offset, whence);
-#else
-        int ret = std::fseek(fp, (long) offset, whence);
-#endif
-        if (ret != 0) {
-            throw std::runtime_error(format("seek error: %s", strerror(errno)));
-        }
-    }
-
-    void read_raw(void * ptr, size_t len) const {
-        if (len == 0) {
-            return;
-        }
-        errno = 0;
-        std::size_t ret = std::fread(ptr, len, 1, fp);
-        if (ferror(fp)) {
-            throw std::runtime_error(format("read error: %s", strerror(errno)));
-        }
-        if (ret != 1) {
-            throw std::runtime_error("unexpectedly reached end of file");
-        }
-    }
-
-    uint32_t read_u32() const {
-        uint32_t ret;
-        read_raw(&ret, sizeof(ret));
-        return ret;
-    }
-
-    void write_raw(const void * ptr, size_t len) const {
-        if (len == 0) {
-            return;
-        }
-        errno = 0;
-        size_t ret = std::fwrite(ptr, len, 1, fp);
-        if (ret != 1) {
-            throw std::runtime_error(format("write error: %s", strerror(errno)));
-        }
-    }
-
-    void write_u32(std::uint32_t val) const {
-        write_raw(&val, sizeof(val));
-    }
-
-    ~llama_file() {
-        if (fp) {
-            std::fclose(fp);
-        }
-    }
-#endif
-};
-using llama_files = std::vector<std::unique_ptr<llama_file>>;
-
-struct llama_mmap {
-    void * addr;
-    size_t size;
-
-    llama_mmap(const llama_mmap &) = delete;
-
-#ifdef _POSIX_MAPPED_FILES
-    static constexpr bool SUPPORTED = true;
-
-    // list of mapped fragments (first_offset, last_offset)
-    std::vector<std::pair<size_t, size_t>> mapped_fragments;
-
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1 /* -1 = max value */, bool numa = false) {
-        size = file->size;
-        int fd = fileno(file->fp);
-        int flags = MAP_SHARED;
-        // prefetch/readahead impairs performance on NUMA systems
-        if (numa)  { prefetch = 0; }
-#ifdef __linux__
-        // advise the kernel to read the file sequentially (increases readahead)
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
-        }
-        if (prefetch) { flags |= MAP_POPULATE; }
-#endif
-        addr = mmap(NULL, file->size, PROT_READ, flags, fd, 0);
-        if (addr == MAP_FAILED) { // NOLINT
-            throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
-        }
-
-        if (prefetch > 0) {
-            // advise the kernel to preload the mapped memory
-            if (posix_madvise(addr, std::min(file->size, prefetch), POSIX_MADV_WILLNEED)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
-                        strerror(errno));
-            }
-        }
-        if (numa) {
-            // advise the kernel not to use readahead
-            // (because the next page might not belong on the same node)
-            if (posix_madvise(addr, file->size, POSIX_MADV_RANDOM)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
-                        strerror(errno));
-            }
-        }
-
-        // initialize list of mapped_fragments
-        mapped_fragments.emplace_back(0, file->size);
-    }
-
-    static void align_range(size_t * first, size_t * last, size_t page_size) {
-        // align first to the next page
-        size_t offset_in_page = *first & (page_size - 1);
-        size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
-        *first += offset_to_page;
-
-        // align last to the previous page
-        *last = *last & ~(page_size - 1);
-
-        if (*last <= *first) {
-            *last = *first;
-        }
-    }
-
-    // partially unmap the file in the range [first, last)
-    void unmap_fragment(size_t first, size_t last) {
-        // note: this function must not be called multiple times with overlapping ranges
-        // otherwise, there is a risk of invalidating addresses that have been repurposed for other mappings
-        int page_size = sysconf(_SC_PAGESIZE);
-        align_range(&first, &last, page_size);
-        size_t len = last - first;
-
-        if (len == 0) {
-            return;
-        }
-
-        GGML_ASSERT(first % page_size == 0);
-        GGML_ASSERT(last % page_size == 0);
-        GGML_ASSERT(last > first);
-
-        void * next_page_start = (uint8_t *) addr + first;
-
-        // unmap the range
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
-        // update the list of mapped fragments to avoid unmapping the same range again in the destructor
-        std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
-        for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                // the range is in the middle of the fragment, split it
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                // the range starts in the middle of the fragment
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                // the range ends in the middle of the fragment
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
-                // the range covers the entire fragment
-            } else {
-                // the range is outside the fragment
-                new_mapped_fragments.push_back(frag);
-            }
-        }
-        mapped_fragments = std::move(new_mapped_fragments);
-    }
-
-    ~llama_mmap() {
-        for (const auto & frag : mapped_fragments) {
-            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-            }
-        }
-    }
-#elif defined(_WIN32)
-    static constexpr bool SUPPORTED = true;
-
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false) {
-        GGML_UNUSED(numa);
-
-        size = file->size;
-
-        HANDLE hFile = (HANDLE) _get_osfhandle(_fileno(file->fp));
-
-        HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-
-        if (hMapping == NULL) {
-            DWORD error = GetLastError();
-            throw std::runtime_error(format("CreateFileMappingA failed: %s", llama_format_win_err(error).c_str()));
-        }
-
-        addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-        DWORD error = GetLastError();
-        CloseHandle(hMapping);
-
-        if (addr == NULL) {
-            throw std::runtime_error(format("MapViewOfFile failed: %s", llama_format_win_err(error).c_str()));
-        }
-
-        if (prefetch > 0) {
-#if _WIN32_WINNT >= 0x602
-            // PrefetchVirtualMemory is only present on Windows 8 and above, so we dynamically load it
-            BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-
-            // may fail on pre-Windows 8 systems
-            pPrefetchVirtualMemory = reinterpret_cast<decltype(pPrefetchVirtualMemory)> (GetProcAddress(hKernel32, "PrefetchVirtualMemory"));
-
-            if (pPrefetchVirtualMemory) {
-                // advise the kernel to preload the mapped memory
-                WIN32_MEMORY_RANGE_ENTRY range;
-                range.VirtualAddress = addr;
-                range.NumberOfBytes = (SIZE_T) std::min(size, prefetch);
-                if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
-                    LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
-                            llama_format_win_err(GetLastError()).c_str());
-                }
-            }
-#else
-            throw std::runtime_error("PrefetchVirtualMemory unavailable");
-#endif
-        }
-    }
-
-    void unmap_fragment(size_t first, size_t last) {
-        // not supported
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
-    }
-
-    ~llama_mmap() {
-        if (!UnmapViewOfFile(addr)) {
-            LLAMA_LOG_WARN("warning: UnmapViewOfFile failed: %s\n",
-                    llama_format_win_err(GetLastError()).c_str());
-        }
-    }
-#else
-    static constexpr bool SUPPORTED = false;
-
-    llama_mmap(struct llama_file * file, size_t prefetch = -1, bool numa = false) {
-        GGML_UNUSED(file);
-        GGML_UNUSED(prefetch);
-        GGML_UNUSED(numa);
-
-        throw std::runtime_error("mmap not supported");
-    }
-
-    void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
-
-        throw std::runtime_error("mmap not supported");
-    }
-#endif
-};
-using llama_mmaps = std::vector<std::unique_ptr<llama_mmap>>;
-
-// Represents some region of memory being locked using mlock or VirtualLock;
-// will automatically unlock on destruction.
-struct llama_mlock {
-    void * addr = NULL;
-    size_t size = 0;
-
-    bool failed_already = false;
-
-    llama_mlock() {}
-    llama_mlock(const llama_mlock &) = delete;
-
-    ~llama_mlock() {
-        if (size) {
-            raw_unlock(addr, size);
-        }
-    }
-
-    void init(void * ptr) {
-        GGML_ASSERT(addr == NULL && size == 0); // NOLINT
-        addr = ptr;
-    }
-
-    void grow_to(size_t target_size) {
-        GGML_ASSERT(addr);
-        if (failed_already) {
-            return;
-        }
-        size_t granularity = lock_granularity();
-        target_size = (target_size + granularity - 1) & ~(granularity - 1);
-        if (target_size > size) {
-            if (raw_lock((uint8_t *) addr + size, target_size - size)) {
-                size = target_size;
-            } else {
-                failed_already = true;
-            }
-        }
-    }
-
-#ifdef _POSIX_MEMLOCK_RANGE
-    static constexpr bool SUPPORTED = true;
-
-    static size_t lock_granularity() {
-        return (size_t) sysconf(_SC_PAGESIZE);
-    }
-
-    #ifdef __APPLE__
-        #define MLOCK_SUGGESTION \
-            "Try increasing the sysctl values 'vm.user_wire_limit' and 'vm.global_user_wire_limit' and/or " \
-            "decreasing 'vm.global_no_user_wire_amount'.  Also try increasing RLIMIT_MEMLOCK (ulimit -l).\n"
-    #else
-        #define MLOCK_SUGGESTION \
-            "Try increasing RLIMIT_MEMLOCK ('ulimit -l' as root).\n"
-    #endif
-
-    bool raw_lock(const void * addr, size_t size) const {
-        if (!mlock(addr, size)) {
-            return true;
-        }
-
-        char* errmsg = std::strerror(errno);
-        bool suggest = (errno == ENOMEM);
-
-        // Check if the resource limit is fine after all
-        struct rlimit lock_limit;
-        if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
-            suggest = false;
-        }
-        if (suggest && (lock_limit.rlim_max > lock_limit.rlim_cur + size)) {
-            suggest = false;
-        }
-
-        LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
-                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
-        return false;
-    }
-
-    #undef MLOCK_SUGGESTION
-
-    static void raw_unlock(void * addr, size_t size) {
-        if (munlock(addr, size)) {
-            LLAMA_LOG_WARN("warning: failed to munlock buffer: %s\n", std::strerror(errno));
-        }
-    }
-#elif defined(_WIN32)
-    static constexpr bool SUPPORTED = true;
-
-    static size_t lock_granularity() {
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        return (size_t) si.dwPageSize;
-    }
-
-    bool raw_lock(void * ptr, size_t len) const {
-        for (int tries = 1; ; tries++) {
-            if (VirtualLock(ptr, len)) {
-                return true;
-            }
-            if (tries == 2) {
-                LLAMA_LOG_WARN("warning: failed to VirtualLock %zu-byte buffer (after previously locking %zu bytes): %s\n",
-                    len, size, llama_format_win_err(GetLastError()).c_str());
-                return false;
-            }
-
-            // It failed but this was only the first try; increase the working
-            // set size and try again.
-            SIZE_T min_ws_size, max_ws_size;
-            if (!GetProcessWorkingSetSize(GetCurrentProcess(), &min_ws_size, &max_ws_size)) {
-                LLAMA_LOG_WARN("warning: GetProcessWorkingSetSize failed: %s\n",
-                        llama_format_win_err(GetLastError()).c_str());
-                return false;
-            }
-            // Per MSDN: "The maximum number of pages that a process can lock
-            // is equal to the number of pages in its minimum working set minus
-            // a small overhead."
-            // Hopefully a megabyte is enough overhead:
-            size_t increment = len + 1048576;
-            // The minimum must be <= the maximum, so we need to increase both:
-            min_ws_size += increment;
-            max_ws_size += increment;
-            if (!SetProcessWorkingSetSize(GetCurrentProcess(), min_ws_size, max_ws_size)) {
-                LLAMA_LOG_WARN("warning: SetProcessWorkingSetSize failed: %s\n",
-                        llama_format_win_err(GetLastError()).c_str());
-                return false;
-            }
-        }
-    }
-
-    static void raw_unlock(void * ptr, size_t len) {
-        if (!VirtualUnlock(ptr, len)) {
-            LLAMA_LOG_WARN("warning: failed to VirtualUnlock buffer: %s\n",
-                    llama_format_win_err(GetLastError()).c_str());
-        }
-    }
-#else
-    static constexpr bool SUPPORTED = false;
-
-    static size_t lock_granularity() {
-        return (size_t) 65536;
-    }
-
-    bool raw_lock(const void * addr, size_t len) const {
-        LLAMA_LOG_WARN("warning: mlock not supported on this system\n");
-        return false;
-    }
-
-    static void raw_unlock(const void * addr, size_t len) {}
-#endif
-};
-using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
 // NOTE: avoid ever using this except for building the token_to_piece caches
 static std::string llama_token_to_piece(const struct llama_model * model, llama_token token, bool special) {
@@ -2080,68 +2104,6 @@ struct llama_state {
 };
 
 static llama_state g_state;
-
-// available llama models
-enum e_model {
-    MODEL_UNKNOWN,
-    MODEL_14M,
-    MODEL_17M,
-    MODEL_22M,
-    MODEL_33M,
-    MODEL_60M,
-    MODEL_70M,
-    MODEL_80M,
-    MODEL_109M,
-    MODEL_137M,
-    MODEL_160M,
-    MODEL_220M,
-    MODEL_250M,
-    MODEL_270M,
-    MODEL_335M,
-    MODEL_410M,
-    MODEL_450M,
-    MODEL_770M,
-    MODEL_780M,
-    MODEL_0_5B,
-    MODEL_1B,
-    MODEL_1_3B,
-    MODEL_1_4B,
-    MODEL_2B,
-    MODEL_2_8B,
-    MODEL_3B,
-    MODEL_4B,
-    MODEL_6B,
-    MODEL_6_9B,
-    MODEL_7B,
-    MODEL_8B,
-    MODEL_9B,
-    MODEL_11B,
-    MODEL_12B,
-    MODEL_13B,
-    MODEL_14B,
-    MODEL_15B,
-    MODEL_16B,
-    MODEL_20B,
-    MODEL_30B,
-    MODEL_34B,
-    MODEL_35B,
-    MODEL_40B,
-    MODEL_65B,
-    MODEL_70B,
-    MODEL_236B,
-    MODEL_314B,
-    MODEL_SMALL,
-    MODEL_MEDIUM,
-    MODEL_LARGE,
-    MODEL_XL,
-    MODEL_A2_7B,
-    MODEL_8x7B,
-    MODEL_8x22B,
-    MODEL_16x12B,
-    MODEL_10B_128x3_66B,
-    MODEL_57B_A14B,
-    MODEL_27B,
-};
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -2747,20 +2709,16 @@ struct llama_context {
     // key + value cache for the self attention
     struct llama_kv_cache kv_self;
 
-    std::mt19937 rng;
-
     bool has_evaluated_once = false;
 
     int64_t t_start_us;
     int64_t t_load_us;
-    int64_t t_sample_us = 0;
     int64_t t_p_eval_us = 0;
     int64_t t_eval_us   = 0;
 
     int64_t t_compute_start_us = 0;
     int64_t n_queued_tokens = 0;
 
-    int32_t n_sample = 0; // number of tokens sampled
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     int32_t n_eval   = 0; // number of eval calls
 
@@ -5230,9 +5188,8 @@ static void llm_load_hparams(
 }
 
 // TODO: This should probably be in llama.h
-static std::vector<llama_vocab::id> llama_tokenize_internal(
-    const llama_vocab & vocab, std::string raw_text, bool add_special, bool parse_special = false
-);
+static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab & vocab, std::string raw_text, bool add_special, bool parse_special = false);
+
 static llama_token llama_byte_to_token(const llama_vocab & vocab, uint8_t ch);
 
 static void llm_load_vocab(
@@ -16820,6 +16777,49 @@ static bool llama_grammar_detect_left_recursion(
     return false;
 }
 
+// TODO: rename to llama_grammar_sample
+void llama_sample_grammar(struct llama_context * ctx, llama_token_data_array * candidates, const struct llama_grammar * grammar) {
+    GGML_ASSERT(ctx);
+    int64_t t_start_sample_us = ggml_time_us();
+
+    bool allow_eog = false;
+    for (const auto & stack : grammar->stacks) {
+        if (stack.empty()) {
+            allow_eog = true;
+            break;
+        }
+    }
+
+    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
+    candidates_decoded.reserve(candidates->size);
+
+    std::vector<llama_grammar_candidate> candidates_grammar;
+    candidates_grammar.reserve(candidates->size);
+
+    for (size_t i = 0; i < candidates->size; ++i) {
+        const llama_token id      = candidates->data[i].id;
+        const std::string & piece = ctx->model.vocab.cache_token_to_piece.at(id);
+
+        if (llama_token_is_eog(&ctx->model, id)) {
+            if (!allow_eog) {
+                candidates->data[i].logit = -INFINITY;
+            }
+        } else if (piece.empty() || piece[0] == 0) {
+            candidates->data[i].logit = -INFINITY;
+        } else {
+            candidates_decoded.push_back(decode_utf8(piece, grammar->partial_utf8));
+            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second });
+        }
+    }
+
+    const auto rejects = llama_grammar_reject_candidates(grammar->rules, grammar->stacks, candidates_grammar);
+    for (const auto & reject : rejects) {
+        candidates->data[reject.index].logit = -INFINITY;
+    }
+
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+}
+
 //
 // grammar - external
 //
@@ -16877,7 +16877,7 @@ struct llama_grammar * llama_grammar_init(
 
     // Important: vec_rules has to be moved here, not copied, because stacks contains
     // pointers to elements of vec_rules. If vec_rules were copied into llama_grammar
-    // then the pointers would be invalidated when the local vec_rules goes out of scope.
+    // then the pointers would be invalidated wen the local vec_rules goes out of scope.
     return new llama_grammar{ std::move(vec_rules), std::move(stacks), {} };
 }
 
@@ -16902,677 +16902,6 @@ struct llama_grammar * llama_grammar_copy(const struct llama_grammar * grammar) 
     }
 
     return result;
-}
-
-//
-// sampling
-//
-
-void llama_set_rng_seed(struct llama_context * ctx, uint32_t seed) {
-    if (seed == LLAMA_DEFAULT_SEED) {
-        seed = time(NULL);
-    }
-    ctx->rng.seed(seed);
-}
-
-void llama_sample_softmax(struct llama_context * ctx, llama_token_data_array * candidates) {
-    GGML_ASSERT(candidates->size > 0);
-
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    // Sort the logits in descending order
-    if (!candidates->sorted) {
-        std::sort(candidates->data, candidates->data + candidates->size, [](const llama_token_data & a, const llama_token_data & b) {
-            return a.logit > b.logit;
-        });
-        candidates->sorted = true;
-    }
-
-    float max_l = candidates->data[0].logit;
-    float cum_sum = 0.0f;
-    for (size_t i = 0; i < candidates->size; ++i) {
-        float p = expf(candidates->data[i].logit - max_l);
-        candidates->data[i].p = p;
-        cum_sum += p;
-    }
-    for (size_t i = 0; i < candidates->size; ++i) {
-        candidates->data[i].p /= cum_sum;
-    }
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_top_k(struct llama_context * ctx, llama_token_data_array * candidates, int32_t k, size_t min_keep) {
-    // TODO: move bucket sort to separate function so that top_p/tail_free/typical/softmax first is equally fast
-    // if (k >= (int32_t)candidates->size) {
-    //     return;
-    // }
-
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    if (k <= 0) {
-        k = candidates->size;
-    }
-
-    k = std::max(k, (int) min_keep);
-    k = std::min(k, (int) candidates->size);
-
-    // Sort scores in descending order
-    if (!candidates->sorted) {
-        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-            return a.logit > b.logit;
-        };
-        if (k <= 128) {
-            std::partial_sort(candidates->data, candidates->data + k, candidates->data + candidates->size, comp);
-        } else {
-            constexpr int   nbuckets     = 128;
-            constexpr float bucket_low   = -10.0f;
-            constexpr float bucket_high  =  10.0f;
-            constexpr float bucket_scale = nbuckets/(bucket_high - bucket_low);
-            constexpr float bucker_inter = -bucket_low * bucket_scale;
-
-            std::vector<int> bucket_idx(candidates->size);
-            std::vector<int> histo(nbuckets, 0);
-
-            for (int i = 0; i < (int)candidates->size; ++i) {
-                const float val = candidates->data[i].logit;
-                int ib = int(bucket_scale * val + bucker_inter); //nbuckets * (val - bucket_low) / (bucket_high - bucket_low);
-                ib = std::max(0, std::min(nbuckets-1, ib));
-                bucket_idx[i] = ib;
-                ++histo[ib];
-            }
-            int nhave = 0;
-            int ib = nbuckets - 1;
-            for ( ; ib >= 0; --ib) {
-                nhave += histo[ib];
-                if (nhave >= k) break;
-            }
-            std::vector<llama_token_data> tmp_tokens(nhave);
-            auto ptr = tmp_tokens.data();
-            std::vector<llama_token_data*> bucket_ptrs;
-            bucket_ptrs.reserve(nbuckets - ib);
-            for (int j = nbuckets - 1; j >= ib; --j) {
-                bucket_ptrs.push_back(ptr);
-                ptr += histo[j];
-            }
-            for (int i = 0; i < (int)candidates->size; ++i) {
-                int j = bucket_idx[i];
-                if (j >= ib) {
-                    *bucket_ptrs[nbuckets-1-j]++ = candidates->data[i];
-                }
-            }
-
-            ptr = tmp_tokens.data();
-            int ndone = 0;
-            for (int j = nbuckets-1; j > ib; --j) {
-                std::sort(ptr, ptr + histo[j], comp);
-                ptr += histo[j];
-                ndone += histo[j];
-            }
-            std::partial_sort(ptr, ptr + k - ndone, ptr + histo[ib], comp);
-
-            std::memcpy(candidates->data, tmp_tokens.data(), k*sizeof(llama_token_data));
-
-        }
-        candidates->sorted = true;
-    }
-    candidates->size = k;
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_top_p(struct llama_context * ctx, llama_token_data_array * candidates, float p, size_t min_keep) {
-    if (p >= 1.0f) {
-        return;
-    }
-
-    llama_sample_softmax(ctx, candidates);
-
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    // Compute the cumulative probabilities
-    float cum_sum = 0.0f;
-    size_t last_idx = candidates->size;
-
-    for (size_t i = 0; i < candidates->size; ++i) {
-        cum_sum += candidates->data[i].p;
-
-        // Check if the running sum is at least p or if we have kept at least min_keep tokens
-        // we set the last index to i+1 to indicate that the current iterate should be included in the set
-        if (cum_sum >= p && i + 1 >= min_keep) {
-            last_idx = i + 1;
-            break;
-        }
-    }
-
-    // Resize the output vector to keep only the top-p tokens
-    candidates->size = last_idx;
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_min_p(struct llama_context * ctx, llama_token_data_array * candidates, float p, size_t min_keep) {
-    if (p <= 0.0f || !candidates->size) {
-        return;
-    }
-
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    bool min_p_applied = false;
-
-    // if the candidates aren't sorted, try the unsorted implementation first
-    if (!candidates->sorted) {
-        std::vector<llama_token_data> filtered_tokens;
-
-        float max_logit = -FLT_MAX;
-        for (size_t i = 0; i < candidates->size; ++i) {
-            max_logit = std::max(max_logit, candidates->data[i].logit);
-        }
-        const float min_logit = max_logit + logf(p); // min logit for p_i >= p * p_max
-
-        for (size_t i = 0; i < candidates->size; ++i) {
-            if (candidates->data[i].logit >= min_logit) {
-                filtered_tokens.push_back(candidates->data[i]);
-            }
-        }
-
-        // if we have enough values the operation was a success
-        if (filtered_tokens.size() >= min_keep) {
-            memcpy(candidates->data, filtered_tokens.data(), filtered_tokens.size()*sizeof(llama_token_data));
-            candidates->size = filtered_tokens.size();
-            min_p_applied = true;
-        }
-    }
-
-    // if the candidates are sorted or the unsorted implementation failed, use this implementation
-    if (!min_p_applied) {
-        // Sort the logits in descending order
-        if (!candidates->sorted) {
-            std::sort(candidates->data, candidates->data + candidates->size, [](const llama_token_data & a, const llama_token_data & b) {
-                return a.logit > b.logit;
-            });
-            candidates->sorted = true;
-        }
-
-        const float min_logit = candidates->data[0].logit + logf(p); // min logit for p_i >= p * p_max
-        size_t i = 1; // first token always matches
-
-        for (; i < candidates->size; ++i) {
-            if (candidates->data[i].logit < min_logit && i >= min_keep) {
-                break; // prob too small
-            }
-        }
-
-        // Resize the output vector to keep only the matching tokens
-        candidates->size = i;
-    }
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_tail_free(struct llama_context * ctx, llama_token_data_array * candidates, float z, size_t min_keep) {
-    if (z >= 1.0f || candidates->size <= 2) {
-        return;
-    }
-
-    llama_sample_softmax(nullptr, candidates);
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    // Compute the first and second derivatives
-    std::vector<float> first_derivatives(candidates->size - 1);
-    std::vector<float> second_derivatives(candidates->size - 2);
-
-    for (size_t i = 0; i < first_derivatives.size(); ++i) {
-        first_derivatives[i] = candidates->data[i].p - candidates->data[i + 1].p;
-    }
-    for (size_t i = 0; i < second_derivatives.size(); ++i) {
-        second_derivatives[i] = first_derivatives[i] - first_derivatives[i + 1];
-    }
-
-    // Calculate absolute value of second derivatives
-    for (size_t i = 0; i < second_derivatives.size(); ++i) {
-        second_derivatives[i] = std::abs(second_derivatives[i]);
-    }
-
-    // Normalize the second derivatives
-    {
-        const float second_derivatives_sum = std::accumulate(second_derivatives.begin(), second_derivatives.end(), 0.0f);
-
-        if (second_derivatives_sum > 1e-6f) {
-            for (float & value : second_derivatives) {
-                value /= second_derivatives_sum;
-            }
-        } else {
-            for (float & value : second_derivatives) {
-                value = 1.0f / second_derivatives.size();
-            }
-        }
-    }
-
-    float cum_sum = 0.0f;
-    size_t last_idx = candidates->size;
-    for (size_t i = 0; i < second_derivatives.size(); ++i) {
-        cum_sum += second_derivatives[i];
-
-        // Check if the running sum is greater than z or if we have kept at least min_keep tokens
-        if (cum_sum > z && i >= min_keep) {
-            last_idx = i;
-            break;
-        }
-    }
-
-    // Resize the output vector to keep only the tokens above the tail location
-    candidates->size = last_idx;
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_typical(struct llama_context * ctx, llama_token_data_array * candidates, float p, size_t min_keep) {
-    // Reference implementation:
-    // https://github.com/huggingface/transformers/compare/main...cimeister:typical-sampling:typical-pr
-    if (p >= 1.0f) {
-        return;
-    }
-
-    // Compute the softmax of logits and calculate entropy
-    llama_sample_softmax(nullptr, candidates);
-
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    float entropy = 0.0f;
-    for (size_t i = 0; i < candidates->size; ++i) {
-        entropy += -candidates->data[i].p * logf(candidates->data[i].p);
-    }
-
-    // Compute the absolute difference between negative log probability and entropy for each candidate
-    std::vector<float> shifted_scores;
-    for (size_t i = 0; i < candidates->size; ++i) {
-        float shifted_score = fabsf(-logf(candidates->data[i].p) - entropy);
-        shifted_scores.push_back(shifted_score);
-    }
-
-    // Sort tokens based on the shifted_scores and their corresponding indices
-    std::vector<size_t> indices(candidates->size);
-    std::iota(indices.begin(), indices.end(), 0);
-
-    std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-        return shifted_scores[a] < shifted_scores[b];
-    });
-
-    // Compute the cumulative probabilities
-    float cum_sum = 0.0f;
-    size_t last_idx = indices.size();
-
-    for (size_t i = 0; i < indices.size(); ++i) {
-        size_t idx = indices[i];
-        cum_sum += candidates->data[idx].p;
-
-        // Check if the running sum is greater than typical or if we have kept at least min_keep tokens
-        if (cum_sum > p && i >= min_keep - 1) {
-            last_idx = i + 1;
-            break;
-        }
-    }
-
-    // Resize the output vector to keep only the locally typical tokens
-    std::vector<llama_token_data> new_candidates;
-    for (size_t i = 0; i < last_idx; ++i) {
-        size_t idx = indices[i];
-        new_candidates.push_back(candidates->data[idx]);
-    }
-
-    // Replace the data in candidates with the new_candidates data
-    std::copy(new_candidates.begin(), new_candidates.end(), candidates->data);
-    candidates->size = new_candidates.size();
-    candidates->sorted = false;
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_entropy(struct llama_context * ctx, llama_token_data_array * candidates_p, float min_temp, float max_temp, float exponent_val) {
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    // no need to do anything if there is only one (or zero) candidates
-    if(candidates_p->size <= 1) {
-        return;
-    }
-
-    // Calculate maximum possible entropy
-    float max_entropy = -logf(1.0f / candidates_p->size);
-
-    llama_sample_softmax(nullptr, candidates_p);
-
-    // Calculate entropy of the softmax probabilities
-    float entropy = 0.0f;
-    for (size_t i = 0; i < candidates_p->size; ++i) {
-        float prob = candidates_p->data[i].p;
-        if (prob > 0.0f) { // Ensure no log(0)
-            entropy -= prob * logf(prob);
-        }
-    }
-
-    // Normalize the entropy (max_entropy cannot be 0 here because we checked candidates_p->size != 1 above)
-    float normalized_entropy = entropy / max_entropy;
-
-    // Map the normalized entropy to the desired temperature range using the power function
-    float dyn_temp = min_temp + (max_temp - min_temp) * powf(normalized_entropy, exponent_val);
-
-#ifdef DEBUG
-    LLAMA_LOG_INFO("Your text maxtemp value is: %f\n", max_temp);
-    LLAMA_LOG_INFO("Entropy: %f\n", entropy);
-    LLAMA_LOG_INFO("Max Possible Entropy: %f\n", max_entropy);
-    LLAMA_LOG_INFO("Normalized Entropy: %f\n", normalized_entropy);
-    LLAMA_LOG_INFO("Exponent: %f\n", exponent_val);
-    LLAMA_LOG_INFO("Dynamic Temperature (dyn_temp): %f\n", dyn_temp);
-#endif
-
-    // Apply the dynamically calculated temperature scaling
-    for (size_t i = 0; i < candidates_p->size; ++i) {
-        candidates_p->data[i].logit /= dyn_temp;
-    }
-
-    // Re-compute softmax probabilities after scaling logits with dynamic temperature
-    double max_l_double = candidates_p->data[0].logit;
-    double cum_sum_double = 0.0;
-    for (size_t i = 0; i < candidates_p->size; ++i) {
-        double p = exp(candidates_p->data[i].logit - max_l_double);
-        candidates_p->data[i].p = p; // Store the scaled probability
-        cum_sum_double += p;
-    }
-    for (size_t i = 0; i < candidates_p->size; ++i) {
-        candidates_p->data[i].p /= cum_sum_double; // Re-normalize the probabilities
-    }
-
-#ifdef DEBUG
-    // Print the updated top 25 probabilities after temperature scaling
-    LLAMA_LOG_INFO("\nUpdated Top 25 Probabilities After Dynamic Temperature Scaling (in percentages):\n");
-    for (size_t i = 0; i < 25 && i < candidates_p->size; ++i) {
-        LLAMA_LOG_INFO("Token %zu: %f%%\n", i + 1, candidates_p->data[i].p * 100.0f);
-    }
-#endif
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_temp(struct llama_context * ctx, llama_token_data_array * candidates_p, float temp) {
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    for (size_t i = 0; i < candidates_p->size; ++i) {
-        candidates_p->data[i].logit /= temp;
-    }
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_repetition_penalties(
-            struct llama_context * ctx,
-          llama_token_data_array * candidates,
-               const llama_token * last_tokens,
-                          size_t   penalty_last_n,
-                           float   penalty_repeat,
-                           float   penalty_freq,
-                           float   penalty_present) {
-    if (penalty_last_n == 0 || (penalty_repeat == 1.0f && penalty_freq == 0.0f && penalty_present == 0.0f)) {
-        return;
-    }
-
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    // Create a frequency map to count occurrences of each token in last_tokens
-    std::unordered_map<llama_token, int> token_count;
-    for (size_t i = 0; i < penalty_last_n; ++i) {
-        token_count[last_tokens[i]]++;
-    }
-
-    // Apply frequency and presence penalties to the candidates
-    for (size_t i = 0; i < candidates->size; ++i) {
-        const auto token_iter = token_count.find(candidates->data[i].id);
-        if (token_iter == token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
-        // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
-        // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (candidates->data[i].logit <= 0) {
-            candidates->data[i].logit *= penalty_repeat;
-        } else {
-            candidates->data[i].logit /= penalty_repeat;
-        }
-
-        candidates->data[i].logit -= float(count) * penalty_freq + float(count > 0) * penalty_present;
-    }
-
-    candidates->sorted = false;
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-}
-
-void llama_sample_grammar(struct llama_context * ctx, llama_token_data_array * candidates, const struct llama_grammar * grammar) {
-    GGML_ASSERT(ctx);
-    int64_t t_start_sample_us = ggml_time_us();
-
-    bool allow_eog = false;
-    for (const auto & stack : grammar->stacks) {
-        if (stack.empty()) {
-            allow_eog = true;
-            break;
-        }
-    }
-
-    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
-    candidates_decoded.reserve(candidates->size);
-
-    std::vector<llama_grammar_candidate> candidates_grammar;
-    candidates_grammar.reserve(candidates->size);
-
-    for (size_t i = 0; i < candidates->size; ++i) {
-        const llama_token id      = candidates->data[i].id;
-        const std::string & piece = ctx->model.vocab.cache_token_to_piece.at(id);
-
-        if (llama_token_is_eog(&ctx->model, id)) {
-            if (!allow_eog) {
-                candidates->data[i].logit = -INFINITY;
-            }
-        } else if (piece.empty() || piece[0] == 0) {
-            candidates->data[i].logit = -INFINITY;
-        } else {
-            candidates_decoded.push_back(decode_utf8(piece, grammar->partial_utf8));
-            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second });
-        }
-    }
-
-    const auto rejects = llama_grammar_reject_candidates(grammar->rules, grammar->stacks, candidates_grammar);
-    for (const auto & reject : rejects) {
-        candidates->data[reject.index].logit = -INFINITY;
-    }
-
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-}
-
-static void llama_log_softmax(float * array, size_t size) {
-    float max_l = *std::max_element(array, array + size);
-    float sum = 0.f;
-    for (size_t i = 0; i < size; ++i) {
-        float p = expf(array[i] - max_l);
-        sum += p;
-        array[i] = p;
-    }
-
-    for (size_t i = 0; i < size; ++i) {
-        array[i] = logf(array[i] / sum);
-    }
-}
-
-void llama_sample_apply_guidance(
-          struct llama_context * ctx,
-                         float * logits,
-                         float * logits_guidance,
-                         float   scale) {
-    GGML_ASSERT(ctx);
-
-    const auto t_start_sample_us = ggml_time_us();
-    const auto n_vocab = llama_n_vocab(llama_get_model(ctx));
-
-    llama_log_softmax(logits, n_vocab);
-    llama_log_softmax(logits_guidance, n_vocab);
-
-    for (int i = 0; i < n_vocab; ++i) {
-              auto & l = logits[i];
-        const auto & g = logits_guidance[i];
-
-        l = scale * (l - g) + g;
-    }
-
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-}
-
-llama_token llama_sample_token_mirostat(struct llama_context * ctx, llama_token_data_array * candidates, float tau, float eta, int32_t m, float * mu) {
-    GGML_ASSERT(ctx);
-
-    auto N = float(llama_n_vocab(llama_get_model(ctx)));
-    int64_t t_start_sample_us;
-    t_start_sample_us = ggml_time_us();
-
-    llama_sample_softmax(nullptr, candidates);
-
-    // Estimate s_hat using the most probable m tokens
-    float s_hat = 0.0;
-    float sum_ti_bi = 0.0;
-    float sum_ti_sq = 0.0;
-    for (size_t i = 0; i < size_t(m - 1) && i < candidates->size - 1; ++i) {
-        float t_i = logf(float(i + 2) / float(i + 1));
-        float b_i = logf(candidates->data[i].p / candidates->data[i + 1].p);
-        sum_ti_bi += t_i * b_i;
-        sum_ti_sq += t_i * t_i;
-    }
-    s_hat = sum_ti_bi / sum_ti_sq;
-
-    // Compute k from the estimated s_hat and target surprise value
-    float epsilon_hat = s_hat - 1;
-    float k = powf((epsilon_hat * powf(2, *mu)) / (1 - powf(N, -epsilon_hat)), 1 / s_hat);
-
-    // Sample the next word X using top-k sampling
-    llama_sample_top_k(nullptr, candidates, int(k), 1);
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    llama_token X = llama_sample_token(ctx, candidates);
-    t_start_sample_us = ggml_time_us();
-
-    // Compute error as the difference between observed surprise and target surprise value
-    size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
-        return candidate.id == X;
-    }));
-    float observed_surprise = -log2f(candidates->data[X_idx].p);
-    float e = observed_surprise - tau;
-
-    // Update mu using the learning rate and error
-    *mu = *mu - eta * e;
-
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    return X;
-}
-
-llama_token llama_sample_token_mirostat_v2(struct llama_context * ctx, llama_token_data_array * candidates, float tau, float eta, float * mu) {
-    int64_t t_start_sample_us;
-    t_start_sample_us = ggml_time_us();
-
-    llama_sample_softmax(ctx, candidates);
-
-    // Truncate the words with surprise values greater than mu
-    candidates->size = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
-        return -log2f(candidate.p) > *mu;
-    }));
-
-    if (candidates->size == 0) {
-        candidates->size = 1;
-    }
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-
-    // Normalize the probabilities of the remaining words
-    llama_sample_softmax(ctx, candidates);
-
-    // Sample the next word X from the remaining words
-    llama_token X = llama_sample_token(ctx, candidates);
-    t_start_sample_us = ggml_time_us();
-
-    // Compute error as the difference between observed surprise and target surprise value
-    size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
-        return candidate.id == X;
-    }));
-    float observed_surprise = -log2f(candidates->data[X_idx].p);
-    float e = observed_surprise - tau;
-
-    // Update mu using the learning rate and error
-    *mu = *mu - eta * e;
-
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    }
-    return X;
-}
-
-llama_token llama_sample_token_greedy(struct llama_context * ctx, llama_token_data_array * candidates) {
-    const int64_t t_start_sample_us = ggml_time_us();
-
-    // Find max element
-    auto * max_iter = std::max_element(candidates->data, candidates->data + candidates->size, [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit < b.logit;
-    });
-
-    llama_token result = max_iter->id;
-    if (ctx) {
-        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-        ctx->n_sample++;
-    }
-    return result;
-}
-
-llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng) {
-    GGML_ASSERT(ctx);
-
-    const int64_t t_start_sample_us = ggml_time_us();
-    llama_sample_softmax(nullptr, candidates);
-
-    std::vector<float> probs;
-    probs.reserve(candidates->size);
-    for (size_t i = 0; i < candidates->size; ++i) {
-        probs.push_back(candidates->data[i].p);
-    }
-
-    std::discrete_distribution<> dist(probs.begin(), probs.end());
-    int idx = dist(rng);
-
-    llama_token result = candidates->data[idx].id;
-
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-    ctx->n_sample++;
-    return result;
-}
-
-llama_token llama_sample_token(struct llama_context * ctx, llama_token_data_array * candidates) {
-    return llama_sample_token_with_rng(ctx, candidates, ctx->rng);
 }
 
 void llama_grammar_accept_token(struct llama_context * ctx, struct llama_grammar * grammar, llama_token token) {
@@ -21764,14 +21093,14 @@ static void llama_log_internal_v(ggml_log_level level, const char * format, va_l
     va_end(args_copy);
 }
 
-static void llama_log_internal(ggml_log_level level, const char * format, ...) {
+void llama_log_internal(ggml_log_level level, const char * format, ...) {
     va_list args;
     va_start(args, format);
     llama_log_internal_v(level, format, args);
     va_end(args);
 }
 
-static void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
+void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
     fputs(text, stderr);
